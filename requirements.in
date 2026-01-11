@@ -1,0 +1,9 @@
+# Add authentication dependencies for FastAPI
+fastapi
+uvicorn
+google-cloud-firestore
+google-cloud-pubsub
+pydantic
+python-jose[cryptography]
+python-dotenv
+google-auth

@@ -1,15 +1,17 @@
+"""Memory Gateway API for Infinity XOS."""
 import os
 import uuid
 import logging
 from typing import Dict, Any, List, Optional
 from datetime import datetime, timezone
 
-from fastapi import FastAPI, HTTPException, Depends, status, Request
+from fastapi import FastAPI, HTTPException, Depends, status
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel, Field
+
 from google.cloud import firestore
 from google.cloud import pubsub_v1
-from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
-from jose import jwt
+
 import google.auth.transport.requests
 import google.oauth2.id_token
 # --------------------------------------------------
@@ -33,6 +35,7 @@ GOOGLE_ISSUERS = [
 security = HTTPBearer()
 
 def verify_google_token(credentials: HTTPAuthorizationCredentials = Depends(security)):
+    """Verifies the Google ID token from the Authorization header."""
     token = credentials.credentials
     try:
         request = google.auth.transport.requests.Request()
@@ -41,8 +44,11 @@ def verify_google_token(credentials: HTTPAuthorizationCredentials = Depends(secu
             raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid issuer.")
         # Optionally, check audience, email, etc. here
         return id_info
-    except Exception as e:
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid or expired token.")
+    except (ValueError, TypeError) as e:
+        logger.error("Authentication failed: %s", e)
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid or expired token."
+        ) from e
 
 # --------------------------------------------------
 # ENV
@@ -71,6 +77,7 @@ publisher = pubsub_v1.PublisherClient() if PROJECT_ID else None
 # --------------------------------------------------
 
 class MemoryWrite(BaseModel):
+    """Represents the data structure for writing a memory entry."""
     agent_id: str
     scope: str
     importance: int = Field(ge=1, le=10)
@@ -80,11 +87,13 @@ class MemoryWrite(BaseModel):
     source: Optional[str] = None
 
 class MemoryQuery(BaseModel):
+    """Represents the data structure for querying memory entries."""
     query: str
     scope: Optional[str] = None
     limit: int = 10
 
 class MemorySummary(BaseModel):
+    """Represents the data structure for summarizing memory entries."""
     scope: str
     max_tokens: int = 1200
 
@@ -93,10 +102,12 @@ class MemorySummary(BaseModel):
 # --------------------------------------------------
 
 def now():
+    """Returns the current UTC datetime."""
     return datetime.now(timezone.utc)
 
 def audit(event: str, payload: Dict[str, Any]):
-    logger.info(f"AUDIT: {event} | {payload}")
+    """Logs an audit event to Firestore and the console."""
+    logger.info("AUDIT: %s | %s", event, payload)
     db.collection(AUDIT_COL).add({
         "event": event,
         "payload": payload,
@@ -105,6 +116,7 @@ def audit(event: str, payload: Dict[str, Any]):
     })
 
 def publish(topic: str, data: Dict[str, Any]):
+    """Publishes a message to a Google Cloud Pub/Sub topic."""
     if not publisher:
         logger.warning("Pub/Sub publisher not initialized; skipping publish.")
         return
@@ -113,9 +125,9 @@ def publish(topic: str, data: Dict[str, Any]):
             publisher.topic_path(PROJECT_ID, topic),
             str(data).encode("utf-8")
         )
-        logger.info(f"Published to topic {topic}: {data}")
-    except Exception as e:
-        logger.error(f"Failed to publish to topic {topic}: {e}")
+        logger.info("Published to topic %s: %s", topic, data)
+    except (ValueError, TypeError) as e:
+        logger.error("Failed to publish to topic %s: %s", topic, e)
 
 # --------------------------------------------------
 # HEALTH
@@ -123,6 +135,7 @@ def publish(topic: str, data: Dict[str, Any]):
 
 @app.get("/health")
 def health():
+    """Health check endpoint."""
     logger.info("Health check called.")
     return {
         "status": "ok",
@@ -135,7 +148,8 @@ def health():
 # --------------------------------------------------
 
 @app.post("/memory/write")
-def write_memory(m: MemoryWrite, user=Depends(verify_google_token)):
+def write_memory(m: MemoryWrite, _user=Depends(verify_google_token)):
+    """Writes a new memory entry to Firestore."""
     mem_id = str(uuid.uuid4())
     record = {
         "id": mem_id,
@@ -151,10 +165,10 @@ def write_memory(m: MemoryWrite, user=Depends(verify_google_token)):
     }
     try:
         db.collection(MEMORY_COL).document(mem_id).set(record)
-        logger.info(f"Memory written: {mem_id} by {m.agent_id}")
-    except Exception as e:
-        logger.error(f"Failed to write memory: {e}")
-        raise HTTPException(status_code=500, detail="Failed to write memory.")
+        logger.info("Memory written: %s by %s", mem_id, m.agent_id)
+    except (ValueError, TypeError) as e:
+        logger.error("Failed to write memory: %s", e)
+        raise HTTPException(status_code=500, detail="Failed to write memory.") from e
     audit("memory_write", record)
     publish("memory-write", record)
     return {"id": mem_id, "status": "stored"}
@@ -164,7 +178,8 @@ def write_memory(m: MemoryWrite, user=Depends(verify_google_token)):
 # --------------------------------------------------
 
 @app.post("/memory/search")
-def search_memory(q: MemoryQuery, user=Depends(verify_google_token)):
+def search_memory(q: MemoryQuery, _user=Depends(verify_google_token)):
+    """Searches for memory entries based on a query and scope."""
     ref = db.collection(MEMORY_COL)
     if q.scope:
         ref = ref.where("scope", "==", q.scope)
@@ -175,10 +190,12 @@ def search_memory(q: MemoryQuery, user=Depends(verify_google_token)):
             data = d.to_dict()
             if q.query.lower() in str(data.get("content", "")).lower():
                 results.append(data)
-        logger.info(f"Memory search: query='{q.query}' scope='{q.scope}' count={len(results)}")
-    except Exception as e:
-        logger.error(f"Failed to search memory: {e}")
-        raise HTTPException(status_code=500, detail="Failed to search memory.")
+        logger.info("Memory search: query=\\\\\\'%s\\\\\\\\\\' scope=\\\\\\'%s\\\\\\\\\\' count=%s", q.query, q.scope, len(results))
+        # TODO: For large datasets, consider integrating with a dedicated full-text search service
+        # (e.g., Elasticsearch, Algolia) for better performance.
+    except (ValueError, TypeError) as e:
+        logger.error("Failed to search memory: %s", e)
+        raise HTTPException(status_code=500, detail="Failed to search memory.") from e
     audit("memory_search", {"query": q.query, "count": len(results)})
     return {"results": results}
 
@@ -187,7 +204,8 @@ def search_memory(q: MemoryQuery, user=Depends(verify_google_token)):
 # --------------------------------------------------
 
 @app.post("/memory/summarize")
-def summarize(req: MemorySummary, user=Depends(verify_google_token)):
+def summarize(req: MemorySummary, _user=Depends(verify_google_token)):
+    """Summarizes memory entries for a given scope."""
     try:
         docs = list(
             db.collection(MEMORY_COL)
@@ -195,7 +213,7 @@ def summarize(req: MemorySummary, user=Depends(verify_google_token)):
             .stream()
         )
         if not docs:
-            logger.warning(f"No memory found for scope: {req.scope}")
+            logger.warning("No memory found for scope: %s", req.scope)
             raise HTTPException(404, "No memory found")
         combined = " ".join(str(d.to_dict()["content"]) for d in docs)
         summary = combined[:req.max_tokens]
@@ -208,10 +226,12 @@ def summarize(req: MemorySummary, user=Depends(verify_google_token)):
             "content": {"summary": summary},
             "created_at": now()
         })
-        logger.info(f"Memory summarized for scope: {req.scope}")
-    except Exception as e:
-        logger.error(f"Failed to summarize memory: {e}")
-        raise HTTPException(status_code=500, detail="Failed to summarize memory.")
+        logger.info("Memory summarized for scope: %s", req.scope)
+        # TODO: For very large datasets, consider an incremental summarization approach
+        # or external summarization service.
+    except (ValueError, TypeError) as e:
+        logger.error("Failed to summarize memory: %s", e)
+        raise HTTPException(status_code=500, detail="Failed to summarize memory.") from e
     audit("memory_summary", {"scope": req.scope})
     publish("memory-summary", {"scope": req.scope})
     return {"status": "summarized"}
@@ -221,7 +241,8 @@ def summarize(req: MemorySummary, user=Depends(verify_google_token)):
 # --------------------------------------------------
 
 @app.post("/memory/rehydrate")
-def rehydrate(user=Depends(verify_google_token)):
+def rehydrate(_user=Depends(verify_google_token)):
+    """Rehydrates system memory entries."""
     try:
         memories = [
             d.to_dict()
@@ -229,10 +250,10 @@ def rehydrate(user=Depends(verify_google_token)):
             .where("rotatable", "==", False)
             .stream()
         ]
-        logger.info(f"Rehydrated system memory count: {len(memories)}")
-    except Exception as e:
-        logger.error(f"Failed to rehydrate memory: {e}")
-        raise HTTPException(status_code=500, detail="Failed to rehydrate memory.")
+        logger.info("Rehydrated system memory count: %s", len(memories))
+    except (ValueError, TypeError) as e:
+        logger.error("Failed to rehydrate memory: %s", e)
+        raise HTTPException(status_code=500, detail="Failed to rehydrate memory.") from e
     audit("rehydrate", {"count": len(memories)})
     return {"system_memory": memories}
 
@@ -241,7 +262,8 @@ def rehydrate(user=Depends(verify_google_token)):
 # --------------------------------------------------
 
 @app.post("/memory/prune")
-def prune(scope: str, hours: int = 720, user=Depends(verify_google_token)):
+def prune(scope: str, hours: int = 720, _user=Depends(verify_google_token)):
+    """Prunes old and low-importance memory entries."""
     cutoff = now().timestamp() - hours * 3600
     removed = 0
     try:
@@ -250,9 +272,9 @@ def prune(scope: str, hours: int = 720, user=Depends(verify_google_token)):
             if rec["importance"] < 5 and rec["created_at"].timestamp() < cutoff:
                 d.reference.delete()
                 removed += 1
-        logger.info(f"Pruned {removed} records from scope: {scope}")
-    except Exception as e:
-        logger.error(f"Failed to prune memory: {e}")
-        raise HTTPException(status_code=500, detail="Failed to prune memory.")
+        logger.info("Pruned %s records from scope: %s", removed, scope)
+    except (ValueError, TypeError) as e:
+        logger.error("Failed to prune memory: %s", e)
+        raise HTTPException(status_code=500, detail="Failed to prune memory.") from e
     audit("prune", {"scope": scope, "removed": removed})
     return {"removed": removed}
